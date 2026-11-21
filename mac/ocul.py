@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import errno
 import fcntl
 import json
 import os
@@ -110,11 +111,57 @@ PIN_HOSTS = {
 TRACE_HOST = "www.cloudflare.com"
 TRACE_PATH = "/cdn-cgi/trace"
 
-WALL_RE = re.compile(
-    r"QuotaExceeded|Free usage limit reached|usage limit reached|"
-    r"FreeUsageLimitError|FreeUsageLimit|rate limit exceeded|too many requests",
-    re.I,
-)
+# The wall is not one event. Three things look alike in a log and need three
+# different answers:
+#
+#   rotate   the free allowance for this (egress /64 x edge) is spent. Only a
+#            fresh block fixes it.
+#   ask      a transient throttle — a bare 429, "too many requests". The
+#            allowance is intact. Rotating here burns a whole /64 on a hiccup,
+#            and a burst of retries turns one hiccup into five spent blocks.
+#   noop     compaction, context-length, model-not-found, content filter. None
+#            of it is quota. Rotating hides the real error behind a new identity.
+#
+# Order is not cosmetic. `Failed to drain Session` is a compaction wrapper whose
+# cause can carry "usage" inside it, so noop is checked first and only matches on
+# the compaction words themselves — a drain that actually hit the free wall
+# still classifies as rotate, because the wall words are the only ones present.
+_RE_NOOP = re.compile(
+    r"compaction|context length|context_length|maximum context|"
+    r"model not found|invalid model|ProviderModelNotFound|"
+    r"content filter|content polic", re.I)
+_RE_ROTATE = re.compile(
+    r"free usage|freeusagelimit|quotaexceeded|quota exceeded|"
+    r"usage limit reached|out of usage|insufficient credits|insufficient balance|"
+    r"payment required|ip (?:is )?blocked|403.*region|region.*403", re.I)
+_RE_ASK = re.compile(
+    r"rate limit|rate_limit_exceeded|too many requests|"
+    r"status(?:Code)?[=: ]*429|HTTP 429|\"code\":\s*429", re.I)
+
+ASK_COOLDOWN = 600          # one logged decision per ten minutes per hiccup
+_WALL_SEEN = {}             # line hash -> ts, so a retry loop cannot flood the log
+
+
+def classify_wall(line):
+    """rotate | ask | noop | '' — one verdict per line, no overlap."""
+    if not line:
+        return ""
+    if _RE_NOOP.search(line):
+        return "noop"
+    if _RE_ROTATE.search(line):
+        return "rotate"
+    if _RE_ASK.search(line):
+        return "ask"
+    return ""
+
+
+def ask_allowed():
+    d = jload(STATE / "ask.json", {}) or {}
+    return now() - int(d.get("ts") or 0) >= ASK_COOLDOWN
+
+
+def ask_note():
+    jsave(STATE / "ask.json", {"ts": int(now())})
 
 EDGE_CACHE_TTL = 300
 DNS_CACHE_TTL = 120
@@ -604,7 +651,9 @@ def current_edge(host, src):
         and st.get("src") == src
         and now() - st.get("ts", 0) < EDGE_CACHE_TTL
     )
-    if fresh and st.get("edge") and st.get("ts", 0) > st.get("reroll_seen", 0):
+    dead = {k: v for k, v in (st.get("dead") or {}).items() if v > now()}
+    if fresh and st.get("edge") and st.get("ts", 0) > st.get("reroll_seen", 0) \
+            and st["edge"] not in dead:
         return st["edge"]
 
     with _EDGE_LOCK:
@@ -614,15 +663,30 @@ def current_edge(host, src):
             and st.get("src") == src
             and now() - st.get("ts", 0) < EDGE_CACHE_TTL
         )
-        if fresh and st.get("edge") and st.get("ts", 0) > st.get("reroll_seen", 0):
+        dead = {k: v for k, v in (st.get("dead") or {}).items() if v > now()}
+        if fresh and st.get("edge") and st.get("ts", 0) > st.get("reroll_seen", 0) \
+                and st["edge"] not in dead:
             return st["edge"]
-        pool = edge_pool(host, src, exclude={st.get("edge")} if st.get("edge") else set())
+        exclude = set(dead)
+        if st.get("edge"):
+            exclude.add(st["edge"])
+        pool = [e for e in edge_pool(host, src, exclude=exclude) if e not in dead]
+        if not pool:
+            # every edge is retired. A retired edge that answers beats no route
+            # at all, and refusing here turns ten minutes of protection into an
+            # outage — but order matters: come back to the one whose retirement
+            # expires first, because that is the one that has had the longest to
+            # recover. Picking at random is how we released an edge one minute
+            # after retiring it while a quieter one sat unused.
+            order = sorted(dead, key=lambda e: dead[e])
+            pool = order or []
         if not pool:
             return None
         edge = random.choice(pool)
         jsave(EDGE_STATE, {
             "host": host, "edge": edge, "src": src, "ts": now(),
             "reroll_seen": st.get("reroll", 0), "reroll": st.get("reroll", 0),
+            "resets": st.get("resets") or {}, "dead": dead,
         })
         return edge
 
@@ -1852,22 +1916,68 @@ def target_of(head: bytes):
     return method, m.group(1), int(m.group(2) or 80)
 
 
+# A WARP rotation removes the tunnel address and adds the new one a moment
+# later. Every connection in that window binds an address that no longer exists,
+# which is not a dead edge and not a dead tunnel — it is a stale local source.
+# Treating it as fatal is what turns a 4-second hop into a burst of 403s the
+# user reads as "the proxy broke".
+STALE_BIND_WAIT = 6.0
+STALE_BIND_POLL = 0.25
+_STALE_ERRNOS = {errno.EADDRNOTAVAIL, errno.EINVAL, errno.ENETDOWN, errno.ENETUNREACH}
+
+
+async def _await_new_src(previous, deadline):
+    """Poll the tunnel for the address WARP assigns after a reconnect."""
+    while True:
+        fresh = iface_v6(force=True)
+        if fresh and fresh != previous:
+            return fresh
+        if time.monotonic() >= deadline:
+            return ""
+        await asyncio.sleep(STALE_BIND_POLL)
+
+
 async def _dial(dest, src):
     loop = asyncio.get_running_loop()
-    sock = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
-    sock.setblocking(False)
-    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-    try:
-        sock.bind((src, 0))
-    except OSError as exc:
-        sock.close()
-        raise FailClosed(f"cannot bind WARP address {src}: {exc}") from exc
-    try:
-        await asyncio.wait_for(loop.sock_connect(sock, dest), CONNECT_TIMEOUT)
-    except (OSError, asyncio.TimeoutError) as exc:
-        sock.close()
-        raise FailClosed(f"connect {dest[0]} failed: {exc}") from exc
-    return sock
+    deadline = time.monotonic() + STALE_BIND_WAIT
+    last = None
+    for _attempt in (1, 2):
+        sock = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+        sock.setblocking(False)
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        try:
+            sock.bind((src, 0))
+        except OSError as exc:
+            sock.close()
+            last = exc
+            if exc.errno not in _STALE_ERRNOS:
+                raise FailClosed(f"cannot bind WARP address {src}: {exc}") from exc
+            fresh = await _await_new_src(src, deadline)
+            if not fresh:
+                raise FailClosed(
+                    f"WARP address {src} is gone and no new one arrived "
+                    f"in {STALE_BIND_WAIT:.0f}s") from exc
+            log(PROXY_LOG, f"repair: tunnel address {src} -> {fresh}, rebinding")
+            STATS["repairs"] += 1
+            src = fresh
+            continue
+        try:
+            await asyncio.wait_for(loop.sock_connect(sock, dest), CONNECT_TIMEOUT)
+            return sock
+        except (OSError, asyncio.TimeoutError) as exc:
+            sock.close()
+            last = exc
+            # a connect that returns EADDRNOTAVAIL is the same stale source seen
+            # one syscall later — the bind raced the tunnel going down
+            if isinstance(exc, OSError) and exc.errno in _STALE_ERRNOS:
+                fresh = await _await_new_src(src, deadline)
+                if fresh:
+                    log(PROXY_LOG, f"repair: tunnel address {src} -> {fresh} mid-connect")
+                    STATS["repairs"] += 1
+                    src = fresh
+                    continue
+            raise FailClosed(f"connect {dest[0]} failed: {exc}") from exc
+    raise FailClosed(f"connect {dest[0]} failed after rebind: {last}")
 
 
 async def dial_any(dests, src):
@@ -1927,30 +2037,102 @@ async def connect_pinned(host, port, src):
 
 
 async def relay(reader, writer):
-    """One direction of a tunnel.
+    """One direction of a tunnel. Returns (read_status, write_status, moved).
 
     On EOF the far side gets write_eof(), not close(): a client that half-closes
     after sending its request must still receive the response, and an SSE stream
     must be able to finish after the upload is done. The read timeout keeps
     abandoned connections from holding fds until the process dies.
+
+    The statuses exist so a connection that was cut can be told apart from one
+    that could not be opened. A read reset is the far side dropping a live
+    stream; a write reset is the near side going away. Neither is a connect
+    failure, and both were previously swallowed by the same `except`.
     """
+    rd, wr, moved = "eof", "ok", False
     try:
         while True:
-            data = await asyncio.wait_for(reader.read(65536), IDLE_TIMEOUT)
-            if not data:
+            try:
+                data = await asyncio.wait_for(reader.read(65536), IDLE_TIMEOUT)
+            except asyncio.TimeoutError:
+                rd = "idle"
                 break
-            writer.write(data)
-            await writer.drain()
-    except (asyncio.TimeoutError, OSError, asyncio.IncompleteReadError):
-        pass
-    except asyncio.CancelledError:
-        raise
+            except asyncio.CancelledError:
+                rd = "cancel"
+                raise
+            except (OSError, asyncio.IncompleteReadError):
+                rd = "reset"
+                break
+            if not data:
+                rd = "eof"
+                break
+            moved = True
+            try:
+                writer.write(data)
+                await writer.drain()
+            except asyncio.CancelledError:
+                wr = "cancel"
+                raise
+            except (OSError, RuntimeError):
+                wr = "reset"
+                break
     finally:
         try:
             if writer.can_write_eof():
                 writer.write_eof()
         except Exception:
             pass
+    return rd, wr, moved
+
+
+EDGE_RETIRE = 600.0        # how long a stream-cutting edge is left out
+EDGE_RESET_WINDOW = 300.0  # the span two cuts must fall inside to retire it
+EDGE_RESET_MAX = 2
+
+
+def note_stream_reset(edge):
+    """An edge that cuts live streams is worse than an edge that never answers.
+
+    A refused connect is visible immediately and the client retries. A stream
+    cut after the first token looks like a broken response: the user sees half a
+    reply and no error. Two of those inside five minutes takes the edge out of
+    the pool for ten, because the wall identity is (block x edge) and moving to
+    a different edge is free.
+    """
+    if not edge:
+        return
+    STATS["stream_reset"] += 1
+    with _EDGE_LOCK:
+        st = jload(EDGE_STATE, {}) or {}
+        resets = {k: [t for t in v if now() - float(t) < EDGE_RESET_WINDOW]
+                  for k, v in (st.get("resets") or {}).items()}
+        hist = (resets.get(edge) or []) + [now()]
+        resets[edge] = hist[-8:]
+        dead = {k: v for k, v in (st.get("dead") or {}).items() if v > now()}
+        if len(hist) >= EDGE_RESET_MAX:
+            dead[edge] = now() + EDGE_RETIRE
+            resets[edge] = []
+            log(PROXY_LOG,
+                f"edge {edge} cut {len(hist)} live streams in "
+                f"{EDGE_RESET_WINDOW:.0f}s — retired for {EDGE_RETIRE:.0f}s")
+        st["resets"] = {k: v for k, v in resets.items() if v}
+        st["dead"] = dead
+        st["ts"] = 0    # force a re-pick on the next request
+        jsave(EDGE_STATE, st)
+
+
+async def pump(reader, writer, uwriter, ureader, used=None):
+    """Both directions, with the outcome named.
+
+    Only the upstream-to-client direction decides a stream reset: bytes already
+    flowed from the edge and then the edge dropped. The other direction is the
+    client leaving, which is normal and must never cost the edge a strike.
+    """
+    (c_rd, _c_wr, _), (u_rd, _u_wr, u_moved) = await asyncio.gather(
+        relay(reader, uwriter), relay(ureader, writer))
+    if used and u_rd == "reset" and u_moved:
+        note_stream_reset(used)
+    return c_rd, u_rd
 
 
 async def handle(reader, writer):
@@ -1988,12 +2170,12 @@ async def handle(reader, writer):
             writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
             await writer.drain()
             established = True
-            await asyncio.gather(relay(reader, uwriter), relay(ureader, writer))
+            await pump(reader, writer, uwriter, ureader, used)
         else:
             established = True
             uwriter.write(head)
             await uwriter.drain()
-            await asyncio.gather(relay(reader, uwriter), relay(ureader, writer))
+            await pump(reader, writer, uwriter, ureader, used)
 
         log(PROXY_LOG, f"{method} {host}:{port} via {used} src {src}")
     except FailClosed as exc:
@@ -2052,6 +2234,8 @@ async def health_report(writer):
         "total": STATS["total"],
         "errors": STATS["errors"],
         "refused": STATS["refused"],
+        "stream_reset": STATS["stream_reset"],
+        "repairs": STATS["repairs"],
         "src": iface_v6(),
         "edge": jload(EDGE_STATE, {}).get("edge"),
         "max_conns": MAX_CONNS,
@@ -2068,7 +2252,8 @@ async def health_report(writer):
         pass
 
 
-STATS = {"started": time.time(), "active": 0, "total": 0, "errors": 0, "refused": 0}
+STATS = {"started": time.time(), "active": 0, "total": 0, "errors": 0,
+         "refused": 0, "stream_reset": 0, "repairs": 0}
 _SEM = None
 
 
@@ -2094,20 +2279,37 @@ async def proxy_serve(port):
 
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
+
+    def _request_stop(*_a):
+        # An event alone is not enough. A live CONNECT tunnel keeps a task alive,
+        # and the unwind below can sit in wait_closed/gather while the loop has
+        # nothing to schedule — the process then survives its own SIGTERM holding
+        # state, which is exactly how two proxies ended up on one port with the
+        # older one invisible. Arm a hard exit first, then ask nicely.
+        stop.set()
+        threading.Thread(target=_hard_exit, args=(3.0,),
+                         name="proxy-exit", daemon=True).start()
+
     for sig in (signal.SIGTERM, signal.SIGINT):
         try:
-            loop.add_signal_handler(sig, stop.set)
+            loop.add_signal_handler(sig, _request_stop)
         except NotImplementedError:
             pass
 
     await stop.wait()
     server.close()
-    await server.wait_closed()
+    try:
+        await asyncio.wait_for(server.wait_closed(), 4)
+    except (asyncio.TimeoutError, Exception):
+        pass
 
     pending = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
     for task in pending:
         task.cancel()
-    await asyncio.gather(*pending, return_exceptions=True)
+    try:
+        await asyncio.wait_for(asyncio.gather(*pending, return_exceptions=True), 4)
+    except (asyncio.TimeoutError, Exception):
+        pass
 
     if PROXY_PID.exists():
         try:
@@ -2116,6 +2318,12 @@ async def proxy_serve(port):
         except Exception:
             pass
     log(PROXY_LOG, "proxy stopped (clean)")
+
+
+def _hard_exit(delay):
+    """Last resort on shutdown: leave, whatever the loop is stuck on."""
+    time.sleep(delay)
+    os._exit(0)
 
 
 def port_open(port, host="127.0.0.1"):
@@ -2911,6 +3119,16 @@ def advise(b):
     if int(px.get("refused") or 0) > 200:
         hit("proxy-refused", "warn",
             f"{px['refused']} refused connections — something upstream is unhappy", 5)
+    # a stream reset is a reply cut after it started arriving. one is a flaky
+    # edge and costs nothing; a rate of them is an edge the pool keeps picking.
+    try:
+        rst, total = int(px.get("stream_reset") or 0), max(1, int(px.get("total") or 1))
+    except Exception:
+        rst, total = 0, 1
+    if rst >= 5 and rst * 100 / total > 2:
+        hit("stream-reset", "warn",
+            f"{rst} replies cut mid-stream ({rst * 100 / total:.1f}% of {total}) — "
+            f"edges that cut are retired after two", 4)
     if sens.get("dns") is False:
         hit("dns", "warn",
             "name resolution through the tunnel is failing", 12)
@@ -2983,7 +3201,9 @@ def brain_publish(health=None, reason="tick"):
                   "active": int(health.get("active") or 0) if live else 0,
                   "total": int(health.get("total") or 0) if live else 0,
                   "errors": int(health.get("errors") or 0) if live else 0,
-                  "refused": int(health.get("refused") or 0) if live else 0},
+                  "refused": int(health.get("refused") or 0) if live else 0,
+                  "stream_reset": int(health.get("stream_reset") or 0) if live else 0,
+                  "repairs": int(health.get("repairs") or 0) if live else 0},
         "rotation": {"active": bool(rot), "phase": rot.get("phase") or "",
                      "pid": int(rot.get("pid") or 0),
                      "since": int(rot.get("started") or 0),
@@ -3504,23 +3724,46 @@ def dispatch_resume(session_ids):
 def matched_line(chunk):
     text = chunk.decode("utf-8", "replace")
     for line in text.splitlines():
-        if WALL_RE.search(line):
+        if classify_wall(line) == "rotate":
             return line.strip()[:200]
     return ""
 
 
 def matched_walls(chunk):
-    """Every wall line in the chunk, with the session it cut off.
+    """Every classified line in the chunk, with the session it cut off.
 
     A burst usually arrives together (one per retrying turn), and resuming only
     the first leaves the other chats dead until the user notices.
+
+    Returns (line, session, verdict) for every line the classifier knows. The
+    caller decides what each verdict is worth — this function used to return
+    only matches for a single pattern, which is why a rate limit and a spent
+    allowance were both treated as "rotate now".
     """
     out = []
     text = chunk.decode("utf-8", "replace")
     for line in text.splitlines():
-        if WALL_RE.search(line):
-            out.append((line.strip(), session_from_line(line)))
+        v = classify_wall(line)
+        if v:
+            out.append((line.strip()[:400], session_from_line(line), v))
     return out
+
+
+def note_ignored(verdict, line):
+    """Record a line we deliberately did not act on — once per ten minutes.
+
+    A decision not to rotate is a decision the user can audit. Silence here is
+    what made a rate-limit storm look identical to a healthy quiet guard, and
+    what made a misclassification impossible to find after the fact.
+    """
+    h = hash(line[:160])
+    t = now()
+    for k in [k for k, ts in _WALL_SEEN.items() if t - ts > 900]:
+        _WALL_SEEN.pop(k, None)
+    if h in _WALL_SEEN:
+        return
+    _WALL_SEEN[h] = t
+    record_wall("wall-ignored", f"{verdict}: {line[:140]}")
 
 
 _LAST_TICK = [0.0]          # monotonic of the guard's last completed tick
@@ -3683,9 +3926,27 @@ def cmd_guard(args):
                 offset, chunk = pump_log(OPENCODE_LOG, offset)
                 walls = matched_walls(chunk) if chunk else []
                 if walls:
-                    for line, _sid in walls:
-                        record_wall("detected", line)
-                    on_wall([sid for _line, sid in walls])
+                    hit, sid_list, asks = [], [], 0
+                    for line, sid, verdict in walls:
+                        if verdict == "rotate":
+                            record_wall("detected", line)
+                            hit.append(line)
+                            if sid:
+                                sid_list.append(sid)
+                        elif verdict == "noop":
+                            note_ignored("not quota — not rotating", line)
+                        elif verdict == "ask":
+                            # check the cooldown once per chunk, not once per
+                            # line: a retry burst is forty copies of one event
+                            asks += 1
+                            if asks == 1 and ask_allowed():
+                                ask_note()
+                                log(GUARD_LOG,
+                                    "rate limited, allowance intact — not rotating: "
+                                    + line[:140])
+                            note_ignored("rate-limit — kept the block", line)
+                    if hit:
+                        on_wall(sid_list)
 
                 st = jload(GUARD_STATE, {})
                 st["offset"] = offset
@@ -4479,6 +4740,15 @@ def cmd_doctor(args):
         ok(f"proxy: 127.0.0.1:{port} pid {health['pid']} v{health.get('version','?')} "
            f"uptime {health.get('uptime',0)}s active {health.get('active',0)} "
            f"total {health.get('total',0)} err {health.get('errors',0)}")
+        rst, rep = int(health.get("stream_reset") or 0), int(health.get("repairs") or 0)
+        if rst or rep:
+            # a stream reset is a reply cut after its first token; a repair is a
+            # request that had to re-bind because the tunnel address moved under
+            # it. both are invisible to the user and both matter.
+            (warn if rst else ok)(
+                f"proxy recovery: {rst} stream resets, {rep} address repairs"
+                + ("  — an edge that cuts replies is retired for 10 minutes"
+                   if rst else ""))
     elif health:
         warn(f"proxy: stale build on {port} (proto {health.get('proto')}, want {PROTO}) — ocul lane replaces it")
     elif port_open(port):
