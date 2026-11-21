@@ -1117,6 +1117,14 @@ final class App: NSObject, NSApplicationDelegate, WKScriptMessageHandler, WKNavi
             // changes only when a hop attaches one, and a panel that showed a
             // stale "next" would be telling the user the wrong account.
             if let k = obj["keys"] as? [String: Any] { p["keys"] = k }
+            // the lane console reads the whole document: tunnel state, the
+            // proxy's recovery counters, what the wall classifier decided and
+            // how long the last hops took. these are small dictionaries and
+            // they change on the same six-second beat as everything else, so
+            // they ride one push instead of five.
+            for key in ["tunnel", "proxy", "walls", "hops", "egress", "identity"] {
+                if let v = obj[key] as? [String: Any] { p[key] = v }
+            }
             push("brain", p)
         }
         refresh(force: false)

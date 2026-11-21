@@ -307,6 +307,9 @@ button.act.busy .dot{display:none}
   font-variant-numeric:tabular-nums}
 .card span{display:block;font-size:var(--t7);letter-spacing:.16em;color:var(--faint);margin-top:2px}
 .card.cy b{color:#a5f3fc}
+/* one measured v6 address, half a card wide. shrink it to fit rather than
+   ellipsise the single value that proves the egress was measured. */
+#egress{font-size:9.2px;letter-spacing:-.02em}
 .card.vi b{color:#c4b5fd}
 .card.ok::before{background:linear-gradient(180deg,var(--ok),rgba(52,211,153,.15))}
 .card.ok b{color:#a7f3d0}
@@ -316,9 +319,9 @@ button.act.busy .dot{display:none}
    squeezed five facts into 15px and clipped every one of them. two shapes
    now: the model strip (the facts that decide whether a prompt lands) and a
    key/value table (state, label beside value, on its own baseline). */
-.mstrip{display:grid;grid-template-columns:0.72fr 1.5fr 0.78fr;gap:var(--s2);
+.mstrip{display:grid;grid-template-columns:0.68fr 1.08fr 0.8fr 0.78fr;gap:var(--s2);
   margin-top:var(--s2);position:relative;z-index:2}
-.ms{display:flex;flex-direction:column;gap:1px;padding:5px 8px;min-width:0;
+.ms{display:flex;flex-direction:column;gap:0;padding:3px 7px;min-width:0;
   border-radius:var(--r2);background:var(--l0);border:1px solid rgba(255,255,255,.055);
   transition:border-color .18s,background .18s}
 .ms b{font-size:11px;font-weight:600;color:#dff2ff;line-height:1.2;letter-spacing:-.01em;
@@ -331,10 +334,11 @@ button.act.busy .dot{display:none}
 .ms.bad b{color:#fecdd3}
 .ms:hover{border-color:rgba(34,211,238,.26);background:rgba(34,211,238,.032)}
 
-.kv{display:grid;grid-template-columns:1fr 1fr;gap:0 var(--s4);
+.kv{display:grid;grid-template-columns:repeat(4,1fr);gap:0 var(--s3);
   margin-top:var(--s2);position:relative;z-index:2}
-.kv .k{display:flex;align-items:baseline;justify-content:space-between;gap:var(--s2);
-  min-width:0;padding:3px 0;border-bottom:1px solid rgba(255,255,255,.045)}
+.kv .k{display:flex;align-items:baseline;justify-content:space-between;gap:3px;
+  min-width:0;padding:2.5px 0;border-bottom:1px solid rgba(255,255,255,.045)}
+.kv .k.wide{grid-column:span 2}
 .kv .k span{font-size:var(--t7);letter-spacing:.13em;color:var(--faint);white-space:nowrap;flex:none}
 .kv .k b{font-size:var(--t9);font-weight:600;color:#c8e6f5;letter-spacing:.02em;
   font-variant-numeric:tabular-nums;white-space:nowrap;overflow:hidden;
@@ -542,6 +546,107 @@ button.act.busy .dot{display:none}
 body.collapsed{background:var(--bg);border-radius:50%}
 body.collapsed #app{opacity:0;transform:scale(.94);pointer-events:none}
 body.collapsed #bubble{display:grid}
+
+/* ============================================================
+   lane console — pass 2
+   three additions, no rewrites: a status line under the header,
+   a rotation block + wall ledger + hop timeline in the lane pane.
+   everything else keeps its id and its handler.
+   ============================================================ */
+:root{
+  --line:rgba(255,255,255,.055);
+  --line2:rgba(255,255,255,.10);
+  --r-bad:#fb7185; --r-ask:#fbbf24; --r-noop:#64748b;
+  --num:ui-monospace,"SF Mono",SFMono-Regular,Menlo,monospace;
+}
+b,#tokTotal,#ringPct,.card b,.ms b,.k b{font-variant-numeric:tabular-nums}
+
+/* ---------- status line ---------------------------------------- */
+.statusline{
+  display:flex;align-items:center;gap:4px;margin-top:5px;
+  font-size:var(--t7);letter-spacing:.09em;text-transform:uppercase;
+  color:var(--faint);position:relative;z-index:2;
+}
+.statusline .sl{
+  display:flex;align-items:center;gap:4px;min-width:0;
+  padding:2.5px 6px;border-radius:999px;
+  background:linear-gradient(180deg,rgba(255,255,255,.035),rgba(255,255,255,.012));
+  border:1px solid var(--line);
+}
+.statusline .sl b{
+  font-size:var(--t9);letter-spacing:0;text-transform:none;
+  color:var(--sub);font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+}
+.statusline .sl b.ok{color:#7ff0cf}
+.statusline .sl b.bad{color:#ff9aa8}
+.statusline .sl b.warn{color:#ffd27d}
+.statusline .dot{width:4px;height:4px;border-radius:50%;background:var(--mut);flex:none}
+.statusline .sl.live .dot{background:#34d399;box-shadow:0 0 6px rgba(52,211,153,.85)}
+.statusline .sl.down .dot{background:#fb7185;box-shadow:0 0 6px rgba(251,113,133,.75)}
+.statusline .grow{flex:1}
+
+/* ---------- rotation block ------------------------------------- */
+.rot{
+  margin-top:0;padding:4px 8px 4px;border-radius:var(--r2);
+  background:linear-gradient(168deg,rgba(34,211,238,.055),rgba(167,139,250,.028));
+  border:1px solid rgba(34,211,238,.16);position:relative;z-index:2;
+}
+.rot.busy{border-color:rgba(34,211,238,.42);box-shadow:0 0 0 1px rgba(34,211,238,.10) inset}
+.rot-top{display:flex;align-items:baseline;gap:5px;margin-bottom:3px}
+.rot-top .caps{font-size:var(--t7);letter-spacing:.12em;color:var(--faint);flex:none}
+.rot-meta{display:flex;align-items:baseline;gap:3px;min-width:0;
+  font-size:var(--t7);letter-spacing:.02em;color:var(--faint);white-space:nowrap;
+  overflow:hidden;text-overflow:ellipsis}
+.rot-meta b{font-size:var(--t9);letter-spacing:0;color:var(--sub);font-weight:600}
+.rot-meta i{font-style:normal;color:rgba(255,255,255,.16)}
+.rot-state{
+  margin-left:auto;flex:none;font-size:var(--t7);letter-spacing:.1em;
+  padding:1.5px 6px;border-radius:999px;color:var(--mut);
+  border:1px solid var(--line);background:rgba(255,255,255,.02);
+}
+.rot.busy .rot-state{color:#bff3ff;border-color:rgba(34,211,238,.4);background:rgba(34,211,238,.1)}
+/* the bar has two lifetimes. busy it fills with the current attempt; idle it
+   is the hop timeline — one hair per hop, green under 8s, amber under 20s,
+   red above. same 3px, no second chart taking a row it does not have. */
+.rot-bar{position:relative;height:3px;border-radius:2px;background:rgba(255,255,255,.06);overflow:hidden}
+.rot-bar i{display:block;height:100%;width:0;border-radius:2px;
+  background:linear-gradient(90deg,#22d3ee,#a78bfa);
+  transition:width .45s cubic-bezier(.22,.61,.36,1)}
+.rot.busy .rot-bar i{
+  background:linear-gradient(90deg,#22d3ee,#67e8f9,#a78bfa);
+  background-size:200% 100%;animation:laneslide 1.1s linear infinite;
+}
+.rot-segs{position:absolute;inset:0;display:flex;gap:1px;align-items:stretch}
+.rot-segs u{flex:1;min-width:0;border-radius:1px;background:rgba(52,211,153,.55);text-decoration:none}
+.rot-segs u.warn{background:rgba(251,191,36,.6)}
+.rot-segs u.bad{background:rgba(251,113,133,.65)}
+.rot-segs u.none{background:rgba(255,255,255,.05)}
+.rot.busy .rot-segs{display:none}
+@keyframes laneslide{from{background-position:0 0}to{background-position:200% 0}}
+
+/* ---------- wall ledger ---------------------------------------- */
+.ledger{
+  margin-top:var(--s2);padding:4px 8px 5px;border-radius:var(--r2);
+  border:1px solid var(--line);background:rgba(255,255,255,.015);position:relative;z-index:2;
+}
+.lg-top{display:flex;align-items:baseline;gap:8px;margin-bottom:3px}
+.lg-top .caps{font-size:var(--t7);letter-spacing:.12em;color:var(--faint);flex:none}
+.lg-top #lgDay{margin-left:auto;font-size:var(--t7);color:var(--faint);letter-spacing:.06em;
+  white-space:nowrap;flex:none}
+.lg-bar{display:flex;height:3px;border-radius:2px;overflow:hidden;background:rgba(255,255,255,.05)}
+.lg-bar i{height:100%;width:0;transition:width .4s ease}
+.lg-bar .lg-r{background:linear-gradient(90deg,#fb7185,#f43f5e)}
+.lg-bar .lg-a{background:#fbbf24}
+.lg-bar .lg-n{background:#475569}
+.lg-keys{display:flex;gap:7px;font-size:var(--t7);letter-spacing:.06em;
+  color:var(--faint);text-transform:uppercase;min-width:0;overflow:hidden}
+.lg-keys b{font-size:var(--t9);color:var(--sub);margin-right:2px;font-weight:600}
+.lg-keys .k-r b{color:#ff9aa8}
+.lg-keys .k-a b{color:#ffd27d}
+.lg-keys .k-n b{color:#94a3b8}
+
+/* ---------- tab: lane ------------------------------------------ */
+.tabs .tab[data-tab="id"].on{background:rgba(34,211,238,.13)}
 </style>
 </head>
 <body>
@@ -557,6 +662,13 @@ body.collapsed #bubble{display:grid}
     <button class="hbtn" id="btnMin" title="collapse to a bubble">−</button>
     <button class="hbtn close" id="btnClose" title="hide — reopen from the menu bar">✕</button>
   </header>
+
+  <div class="statusline" id="statusline">
+    <span class="sl live" id="slTun"><i class="dot"></i><b id="sTun">—</b></span>
+    <span class="sl" title="the /64 the quota is counted against"><b id="sPrefix">—</b><span>·64</span></span>
+    <span class="grow"></span>
+    <span class="sl" id="slHealth"><b id="sHealth">—</b><span>health</span></span>
+  </div>
 
   <div class="project"><i class="pdot"></i><span class="pname" id="project">idle — no session</span><span class="pmodel" id="pmodel" title="the model this session is pinned to"><i></i><b id="pmodelName">—</b></span></div>
 
@@ -609,7 +721,7 @@ body.collapsed #bubble{display:grid}
   </section>
 
   <nav class="tabs" id="tabs">
-    <button class="tab on" data-tab="id">IDENTITY<i></i></button>
+    <button class="tab on" data-tab="id">LANE<i></i></button>
     <button class="tab" data-tab="keys">KEYS<b id="tabKeys"></b></button>
     <button class="tab" data-tab="stats">STATS</button>
   </nav>
@@ -617,27 +729,59 @@ body.collapsed #bubble{display:grid}
   <div class="panes">
 
     <div class="pane on" data-pane="id">
+
+      <!-- one block for the rotator and the hop history: busy it shows
+           progress, idle it shows the last twenty-four hops as a strip.
+           same width, same row — no second chart competing for 196px. -->
+      <section class="rot" id="rotBlock">
+        <div class="rot-top">
+          <span class="caps">ROTATION</span>
+          <span class="rot-meta">
+            <b id="rotLast">—</b><i>·</i><b id="rotMode">—</b><i>·</i><b id="rotTook">—</b>
+          </span>
+          <span class="rot-state" id="rotState">idle</span>
+        </div>
+        <div class="rot-bar" id="rotBar">
+          <i id="rotFill"></i>
+          <span class="rot-segs" id="rotSegs"></span>
+        </div>
+      </section>
+
       <section class="grid">
         <div class="card cy"><b id="egress">—</b><span id="egressFam">EGRESS</span></div>
         <div class="card vi"><b id="prefix">—</b><span>QUOTA /64</span></div>
-        <div class="card"><b id="hops">0</b><span>ROTATIONS</span></div>
-        <div class="card"><b id="device">—</b><span>DEVICE</span></div>
       </section>
 
-      <!-- the second lever: how many models answer right now and how old the
-           measurement is. this predicts whether the next prompt lands better
-           than any tunnel fact does, so it sits on its own row. -->
       <section class="mstrip">
-        <div class="ms" id="cardLive"><b id="mLive">—</b><span>MODELS LIVE</span></div>
+        <div class="ms" id="cardLive"><b id="mLive">—</b><span>LIVE</span></div>
         <div class="ms" id="cardBest"><b id="mBest">—</b><span>BEST · <s id="mLadder">—</s></span></div>
         <div class="ms"><b id="mBucket">—</b><span>BUCKET</span></div>
+        <div class="ms" id="pxChip" title="proxy pool — add, test, rotate, system proxy"><b id="mProxy">—</b><span>PROXY</span></div>
       </section>
 
       <section class="kv">
-        <div class="k"><span>LAST HOP</span><b id="mSince">—</b></div>
-        <div class="k"><span>WALLS</span><b id="mWalls">0</b></div>
+        <div class="k"><span>SINCE</span><b id="mSince">—</b></div>
+        <div class="k" title="walls recorded against this /64 — the ledger below counts today"><span>WALLS·/64</span><b id="mWalls">0</b></div>
         <div class="k"><span>BURNED</span><b id="mBurned">0</b></div>
-        <div class="k" id="pxChip" title="proxy pool — add, test, rotate, system proxy"><span>PROXY</span><b id="mProxy">—</b></div>
+        <div class="k"><span>ROTATIONS</span><b id="hops">0</b></div>
+        <div class="k wide"><span>DEVICE</span><b id="device">—</b></div>
+        <div class="k" title="replies the far edge cut after they started arriving — each one is a retried turn"><span>RESETS</span><b id="rcReset">0</b></div>
+        <div class="k" title="requests that re-bound because the tunnel address moved under them"><span>REPAIRS</span><b id="rcRepair">0</b></div>
+      </section>
+
+      <section class="ledger">
+        <div class="lg-top">
+          <span class="caps">WALLS · TODAY</span>
+          <span class="lg-keys">
+            <span class="k-r" title="a real wall — the free allowance for this /64 is spent"><b id="lgRotN">0</b>rotate</span>
+            <span class="k-a" title="a transient throttle — the allowance is intact, the block was kept"><b id="lgAskN">0</b>kept</span>
+            <span class="k-n" title="compaction, context length, model not found — never quota"><b id="lgNoopN">0</b>ignored</span>
+          </span>
+          <span id="lgDay">—</span>
+        </div>
+        <div class="lg-bar">
+          <i class="lg-r" id="lgRot"></i><i class="lg-a" id="lgAsk"></i><i class="lg-n" id="lgNoop"></i>
+        </div>
       </section>
     </div>
 
@@ -816,6 +960,11 @@ const age = (s) => {
 
 /* ---------- state ---------- */
 let S = {};
+// brain sections that only ever arrive on the 6 s push (tunnel, proxy, the
+// wall ledger, the hop timeline). render() replaces S wholesale on every
+// status tick, so keeping them in S would mean losing them twice a second.
+// this is the same merge the key pool needed, for the same reason.
+let LANE = {};
 
 function healthChip(label, state, hint, act){
   // "idle" is neither good nor broken — the leak guard being off is the design,
@@ -896,6 +1045,163 @@ function snapBarText(){
     ? Math.floor(secs / 60) + "m " + String(secs % 60).padStart(2, "0") + "s"
     : secs + "s";
   return "SNAPSHOT DEAD " + span + " — " + t + " · chips are the last good paint";
+}
+
+
+/* ---------- lane console ---------------------------------------- */
+const pfx6 = (v) => {
+  if (!v) return "—";
+  const parts = String(v).split(":");
+  return parts.length > 2 ? parts.slice(-2).join(":") : String(v);
+};
+/* A v6 address is 24 to 39 glyphs and the card is half the pane. Rather than
+   pick a font size that fits today's address and clip tomorrow's, try the full
+   form, then two progressively shorter ones, and keep the first that fits. The
+   full string stays in the tooltip either way. */
+function squeeze6(el, full){
+  if (!el) return;
+  const parts = String(full || "").split(":");
+  const cand = [full];
+  if (parts.length >= 6) {
+    cand.push(parts.slice(0, 2).join(":") + ":" + parts[parts.length - 2] + ":" + parts[parts.length - 1]);
+    cand.push(parts.slice(0, 2).join(":") + "…" + parts[parts.length - 1]);
+  }
+  for (const c of cand) {
+    el.textContent = c;
+    if (el.scrollWidth <= el.clientWidth + 1) break;
+  }
+  if (el.title) el.title = el.title;
+}
+
+const secs = (v) => {
+  v = Number(v) || 0;
+  return v >= 10 ? Math.round(v) + "s" : (Math.round(v * 10) / 10) + "s";
+};
+
+function paintLane(d){
+  const b = Object.assign({}, LANE, d.brain || {});
+  // two documents describe the same machine: the 6 s brain (wide) and the 2 s
+  // status (narrow, flat). read the wide shape first and fall back to the flat
+  // one, so the console is right on the very first paint, before any push.
+  const tun = b.tunnel || d.tunnel || d.warp || {};
+  const hlt = b.health || {
+    score: (b.score != null ? b.score : ((d.brain || {}).score)),
+    state: (b.state || (d.brain || {}).state || "")
+  };
+  const pfx = (b.egress && b.egress.prefix) || (d.identity || {}).prefix || "";
+  // "is the tunnel up" has three possible sources and none of them is wrong:
+  // the brain's tunnel section carries the addresses, warp carries the state,
+  // the status document carries a flat flag. any true is true.
+  const up = tun.connected === true
+          || (b.warp && b.warp.connected === true)
+          || (d.warp && d.warp.connected === true);
+
+  // status line — one glance, three facts: is the tunnel up, which /64 is
+  // being spent, and how sick is the machine. everything else is detail.
+  const sl = $("slTun");
+  if (sl) sl.className = "sl " + (up ? "live" : "down");
+  const st = $("sTun");
+  if (st) { st.textContent = up ? "tunnel" : "down"; st.className = up ? "ok" : "bad"; }
+  const sp = $("sPrefix"); if (sp) sp.textContent = pfx6(pfx);
+  const sh = $("sHealth");
+  const score = (hlt.score == null) ? null : Number(hlt.score);
+  if (sh) {
+    sh.textContent = score == null ? "—" : score;
+    sh.className = score == null ? "" : score >= 80 ? "ok" : score >= 50 ? "warn" : "bad";
+  }
+
+  // rotation
+  const rot = b.rotation || d.rotation || {};
+  const active = !!rot.active;
+  const block = $("rotBlock");
+  if (block) block.className = "rot" + (active ? " busy" : "");
+  const rs = $("rotState");
+  if (rs) {
+    rs.textContent = active
+      ? ((rot.phase || "working") + (rot.attempt ? " " + rot.attempt + "/" + (rot.max || 14) : ""))
+      : (rot.mode ? "idle" : "idle");
+  }
+  const max = Math.max(1, Number(rot.max) || 14);
+  const done = Math.min(max, Number(rot.attempt) || 0);
+  $("rotFill").style.width = active ? Math.max(8, Math.round((done / max) * 100)) + "%" : "0%";
+
+  // hop history — the only place a slow hop stays visible after the fact,
+  // and it lives in the rotation bar so it costs no row of its own.
+  const hs = b.hops || {};
+  const rows = Array.isArray(hs.recent) ? hs.recent.slice(-24) : [];
+  const last = rows.length ? rows[rows.length - 1] : null;
+  const nowTs = Number(d.ts) || (Date.now() / 1000);
+  $("rotLast").textContent = last ? age(Math.max(0, Math.round(nowTs - last.ts))) : "—";
+  $("rotMode").textContent = (last && last.mode) ? last.mode : (rot.mode || "—");
+  $("rotTook").textContent = last && last.took != null ? secs(last.took) : "—";
+  if (last) {
+    $("rotTook").title = "last hop landed on " + (last.bucket || "unmeasured")
+      + (last.moved ? " (moved)" : " (same block)")
+      + " in " + secs(last.took) + " via " + (last.mode || "hop");
+  }
+
+  const segs = $("rotSegs");
+  if (segs) {
+    if (!rows.length) {
+      segs.innerHTML = '<u class="none"></u>';
+    } else {
+      const mean = rows.reduce((a, r) => a + (Number(r.took) || 0), 0) / rows.length;
+      const best = Math.min(...rows.map(r => Number(r.took) || 0));
+      const worst = Math.max(...rows.map(r => Number(r.took) || 0), 1);
+      let out = "";
+      for (const r of rows) {
+        const t = Number(r.took) || 0;
+        const cls = t >= 20 ? "bad" : t >= 8 ? "warn" : "";
+        // width is proportional to the hop's own duration, floored so a 4s
+        // hop is still a visible hair next to a 60s one
+        const w = Math.max(4, Math.round((t / worst) * 100));
+        out += '<u class="' + cls + '" style="flex:' + w + ' 1 0" title="'
+             + (r.mode || "hop") + " · " + secs(t) + " · " + (r.bucket || "no bucket")
+             + '"></u>';
+      }
+      segs.innerHTML = out;
+      const blk = $("rotBlock");
+      if (blk) blk.title = rows.length + " hops kept · avg " + secs(mean)
+        + " · best " + secs(best) + " — a 60s row next to twelve 5s rows is the diagnosis";
+    }
+  }
+
+  // wall ledger — what the classifier decided, not what the log happened to say
+  const wl = b.walls || {};
+  const r = Number(wl.rotate) || 0, a = Number(wl.ask) || 0, n = Number(wl.noop) || 0;
+  const tot = r + a + n;
+  const pctw = (v) => tot ? (v / tot) * 100 : 0;
+  const lr = $("lgRot"), la = $("lgAsk"), ln = $("lgNoop");
+  if (lr) lr.style.width = pctw(r) + "%";
+  if (la) la.style.width = pctw(a) + "%";
+  if (ln) ln.style.width = pctw(n) + "%";
+  $("lgRotN").textContent = r;
+  $("lgAskN").textContent = a;
+  $("lgNoopN").textContent = n;
+  const ld = $("lgDay");
+  if (ld) {
+    ld.textContent = (wl.day || "").slice(5).replace("-", "/") || (tot ? "" : "quiet");
+    ld.title = "rotate = a real wall; kept = a transient throttle that did not cost a /64; "
+             + "ignored = compaction, context length or a model error, never quota";
+  }
+
+  // proxy recovery — invisible in normal use, decisive when a reply stops
+  const px = b.proxy || d.proxy || {};
+  const rcR = $("rcReset"), rcP = $("rcRepair");
+  if (rcR) {
+    rcR.textContent = Number(px.stream_reset) || 0;
+    rcR.className = (Number(px.stream_reset) || 0) > 0 ? "warn" : "";
+  }
+  if (rcP) rcP.textContent = Number(px.repairs) || 0;
+
+  // last, because it measures: the egress card carries a full address in a
+  // half-width cell and the honest fix is to fit the string, not the font.
+  const eg = $("egress");
+  if (eg) {
+    const full = (b.egress && b.egress.ip) || d.egress4 || eg.dataset.full || eg.textContent;
+    eg.dataset.full = full;
+    squeeze6(eg, full);
+  }
 }
 
 function render(d){
@@ -1004,6 +1310,7 @@ function render(d){
         ? (" · this is the v6 exit; its /64 is the quota bucket beside it"
            + (v4 ? " · last known v4 " + v4 : " · v4 not measured"))
         : "");
+  paintLane(d);
   $("prefix").textContent = id.prefix || "—";
   $("prefix").title = id.prefix
     ? ("the quota bucket — one /64 per WARP exit, and every address in that /64 draws on it"
@@ -1490,6 +1797,7 @@ window.ouc = function(ev){
     // has no pool of its own, and a painter that runs before the merge reads
     // last tick's document.
     S.brain = Object.assign(S.brain || {}, p);
+    LANE = Object.assign(LANE, p);
     paintBrain(p);
     // the rotator's lock arrives on the fast path too. without this the HOP
     // gate could only ever be as fresh as the 2s status tick, and a rotation

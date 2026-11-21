@@ -63,6 +63,7 @@ HOME = Path.home()
 ROOT = Path(os.environ.get("OCUL_ROOT", HOME / ".local/share/ocu-lane"))
 STATE = Path(os.environ.get("OCUL_STATE", HOME / ".local/state/ocu-lane"))
 PROXY_PID = STATE / "proxy.pid"
+PROXY_LOCK = STATE / "proxy.lock"
 PROXY_LOG = STATE / "proxy.log"
 GUARD_LOG = STATE / "guard.log"
 GUARD_BEAT = STATE / "guard-beat.json"
@@ -194,6 +195,7 @@ VERSION = "1.2.0"
 # (long sleep, log rotation, guard restart) resumes near the tail instead of
 # replaying history and burning registrations on old quota errors.
 READ_CHUNK = 256 * 1024
+GUARD_MAX_READS = 8       # 2 MB of log per tick before we let the rest wait
 CATCHUP_MAX = 1024 * 1024
 TAIL_WINDOW = 128 * 1024
 
@@ -235,6 +237,20 @@ def jsave(path, data):
     ensure_dirs()
     tmp = Path(f"{path}.{os.getpid()}.{threading.get_ident()}.tmp")
     tmp.write_text(json.dumps(data))
+    # A rename is atomic, but only against readers — not against a power cut.
+    # Without the fsync the directory entry can point at a file whose data never
+    # reached the disk, and every reader of guard.json gets a zero-length file
+    # that json turns into {}. That is a guard that forgets its offset, its
+    # blacklist and its hop count at once, which looks exactly like a fresh
+    # install and behaves like a bug. ~0.2 ms per write, once a tick at most.
+    try:
+        fd = os.open(tmp, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except OSError:
+        pass
     try:
         os.replace(tmp, path)
     except OSError:
@@ -1409,6 +1425,7 @@ def rotate(verbose=True, lock_timeout=30, cheap_first=True, reason=""):
         glock.release()
         raise
 
+    rot_t0 = time.time()
     mark_rotation_phase("starting", {"max": 14})
     paused = pause_keeper()
     try:
@@ -1592,6 +1609,8 @@ def rotate(verbose=True, lock_timeout=30, cheap_first=True, reason=""):
                     overlay_rotate(old_bucket, c_key, did)
                     publish_overlay_state("rotate")
                     LAST_MODE["mode"] = "rotate-keys"
+                    hops_remember(time.time() - rot_t0, c_key != old_bucket,
+                                  before_pfx, c_pfx, c_key)
                     mark_rotation_phase("done", {"moved": c_key})
                     say(f"bucket {c_key}  tunnel {c_pfx}"
                         f"  (rotate-keys, no device burn)")
@@ -1808,6 +1827,7 @@ def rotate(verbose=True, lock_timeout=30, cheap_first=True, reason=""):
 
         LAST_MODE["mode"] = "burn"
         key, after_addr, after_pfx, egress, did = accepted
+        hops_remember(time.time() - rot_t0, True, before_pfx, after_pfx, key)
         _OVERLAY_DEV.update(id=did, ts=time.time())
         st.update({"last_hop": now(), "hops": st.get("hops", 0) + 1,
                    "prefix": after_pfx, "addr": after_addr,
@@ -1857,6 +1877,58 @@ def registration_id():
         if line.startswith("ID:"):
             return line.split(":", 1)[1].strip()
     return "????????"
+
+
+WALL_COUNTS = STATE / "wall-counts.json"
+HOPS_STATE = STATE / "hops.json"
+HOPS_KEEP = 24
+
+
+def _day_key():
+    return time.strftime("%Y-%m-%d", time.localtime())
+
+
+def wall_counts():
+    d = jload(WALL_COUNTS, {}) or {}
+    if d.get("day") != _day_key():
+        return {"day": _day_key(), "rotate": 0, "ask": 0, "noop": 0}
+    return {"day": d["day"], "rotate": int(d.get("rotate") or 0),
+            "ask": int(d.get("ask") or 0), "noop": int(d.get("noop") or 0)}
+
+
+def wall_bump(kind):
+    """Count what the classifier decided, per local day.
+
+    walls.jsonl keeps the evidence but it is append-only and capped, so reading
+    it to answer "how many rotations today" costs a growing scan on every HUD
+    tick. A three-integer counter is the same truth in O(1), and the day stamp
+    makes it self-clearing.
+    """
+    try:
+        d = wall_counts()
+        d[kind] = int(d.get(kind) or 0) + 1
+        jsave(WALL_COUNTS, d)
+    except Exception:
+        pass
+
+
+def hops_remember(took, moved, before, after, bucket=""):
+    """One row per finished rotation: how long it took and what moved.
+
+    The HUD draws these as a timeline. It is also the only place a slow hop is
+    visible after the fact — the console scrolls and the log rotates, but a row
+    that says 41 s next to twelve rows that say 5 s is the whole diagnosis.
+    """
+    try:
+        hist = jload(HOPS_STATE, {}) or {}
+        rows = [r for r in (hist.get("recent") or []) if isinstance(r, dict)]
+        rows.append({"ts": int(time.time()), "took": round(float(took), 1),
+                     "moved": bool(moved), "device": before or "",
+                     "device_after": after or "", "bucket": bucket or "",
+                     "mode": LAST_MODE.get("mode") or "rotate"})
+        jsave(HOPS_STATE, {"recent": rows[-HOPS_KEEP:]})
+    except Exception:
+        pass
 
 
 def record_wall(what, extra=""):
@@ -2257,9 +2329,52 @@ STATS = {"started": time.time(), "active": 0, "total": 0, "errors": 0,
 _SEM = None
 
 
+_PROXY_LOCK_FH = None
+
+
+def _release_proxy_lock():
+    global _PROXY_LOCK_FH
+    fh, _PROXY_LOCK_FH = _PROXY_LOCK_FH, None
+    if fh is None:
+        return
+    try:
+        fcntl.flock(fh, fcntl.LOCK_UN)
+    except Exception:
+        pass
+    try:
+        fh.close()
+    except Exception:
+        pass
+
+
 async def proxy_serve(port):
-    global _SEM
+    global _SEM, _PROXY_LOCK_FH
     ensure_dirs()
+    # One proxy per machine, enforced by the kernel rather than by hoping.
+    # Three callers want this port — the lane, the guard's keepalive and a
+    # manual `ocul proxy` — and the loser used to die on EADDRINUSE with a
+    # traceback while the winner kept serving whatever code it was started
+    # with. That is how a restart "does nothing": the old process still owns
+    # the socket and the new one is already gone.
+    try:
+        _PROXY_LOCK_FH = open(PROXY_LOCK, "a+")
+        fcntl.flock(_PROXY_LOCK_FH, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        holder = "?"
+        try:
+            holder = PROXY_LOCK.read_text().strip() or "?"
+        except Exception:
+            pass
+        log(PROXY_LOG, f"proxy already running (pid {holder}) — this one is leaving")
+        print(f"ocul: proxy already running on {port} (pid {holder})")
+        return 0
+    try:
+        _PROXY_LOCK_FH.seek(0)
+        _PROXY_LOCK_FH.truncate()
+        _PROXY_LOCK_FH.write(str(os.getpid()))
+        _PROXY_LOCK_FH.flush()
+    except Exception:
+        pass
     PROXY_PID.write_text(str(os.getpid()))
     _SEM = asyncio.Semaphore(MAX_CONNS)
     STATS["started"] = time.time()
@@ -2273,7 +2388,40 @@ async def proxy_serve(port):
         async with _SEM:
             await handle(reader, writer)
 
-    server = await asyncio.start_server(limited, "127.0.0.1", port, backlog=512)
+    # The flock above only protects instances that carry this code. A proxy
+    # started before it exists still owns the socket, so the bind is the second
+    # half of the guard: losing the race is a normal outcome, not a crash, and a
+    # traceback here is what made "restart the proxy" look like a failure.
+    try:
+        server = await asyncio.start_server(limited, "127.0.0.1", port, backlog=512)
+    except OSError as exc:
+        if exc.errno in (errno.EADDRINUSE, errno.EACCES):
+            log(PROXY_LOG, f"port {port} is already held by another process — leaving")
+            print(f"ocul: port {port} is already held by another process — this proxy is leaving")
+            try:
+                _PROXY_LOCK_FH.close()
+            except Exception:
+                pass
+            return 0
+        raise
+        # The lock is the first line of defence, but a proxy started before the
+        # lock existed holds this port without holding it. An EADDRINUSE is a
+        # statement of fact — one proxy per port — not a crash: say who is there
+        # and leave, so the caller's keepalive can decide rather than read a
+        # traceback and treat the port as broken.
+        if exc.errno in (errno.EADDRINUSE, errno.EACCES):
+            holder = ""
+            try:
+                holder = PROXY_PID.read_text().strip()
+            except Exception:
+                pass
+            log(PROXY_LOG, f"port {port} already served"
+                           f"{(' by pid ' + holder) if holder else ''} — leaving")
+            print(f"ocul: port {port} already served"
+                  f"{(' by pid ' + holder) if holder else ''}")
+            _release_proxy_lock()
+            return 0
+        raise
     src = iface_v6(force=True)
     log(PROXY_LOG, f"proxy up on 127.0.0.1:{port} proto={PROTO} src {src}")
 
@@ -3187,6 +3335,11 @@ def brain_publish(health=None, reason="tick"):
         "guard": {"running": True, "pid": os.getpid(), "tick": TICK,
                   "pending": bool(st.get("pending_wall"))},
         "keeper": {"running": keeper_running()},
+        # the classifier ledger and the hop timeline. both are read from small
+        # state files, so this stays a tick-cost addition, not a scan.
+        "walls": wall_counts(),
+        "hops": {"total": int(st.get("hops") or 0),
+                 "recent": (jload(HOPS_STATE, {}) or {}).get("recent") or []},
         "egress": {"ip": eg_ip, "prefix": eg_pfx, "at": int(eg_at),
                    "colo": cached.get("colo") or "",
                    "warp": cached.get("warp") or "",
@@ -3923,22 +4076,43 @@ def cmd_guard(args):
         while True:
             ticks += 1
             try:
-                offset, chunk = pump_log(OPENCODE_LOG, offset)
+                # Bounded catch-up. One chunk per tick is fine at a trickle and
+                # fatal at a flood: a retry storm writes faster than 256 KB per
+                # 6 s, so the offset falls behind and every wall in the burst is
+                # detected minutes late — after the user has already retried
+                # five times. Read up to the catch-up ceiling per tick, then
+                # leave the rest for the next one.
+                chunks = []
+                for _ in range(GUARD_MAX_READS):
+                    offset, part = pump_log(OPENCODE_LOG, offset)
+                    if not part:
+                        break
+                    chunks.append(part)
+                    if len(part) < READ_CHUNK:
+                        break
+                chunk = b"".join(chunks)
+                if len(chunks) >= GUARD_MAX_READS:
+                    log_throttled(GUARD_LOG, "log-lag",
+                                  f"log is arriving faster than {GUARD_MAX_READS} "
+                                  f"reads/tick — still catching up", every=300)
                 walls = matched_walls(chunk) if chunk else []
                 if walls:
                     hit, sid_list, asks = [], [], 0
                     for line, sid, verdict in walls:
                         if verdict == "rotate":
+                            wall_bump("rotate")
                             record_wall("detected", line)
                             hit.append(line)
                             if sid:
                                 sid_list.append(sid)
                         elif verdict == "noop":
+                            wall_bump("noop")
                             note_ignored("not quota — not rotating", line)
                         elif verdict == "ask":
                             # check the cooldown once per chunk, not once per
                             # line: a retry burst is forty copies of one event
                             asks += 1
+                            wall_bump("ask")
                             if asks == 1 and ask_allowed():
                                 ask_note()
                                 log(GUARD_LOG,
